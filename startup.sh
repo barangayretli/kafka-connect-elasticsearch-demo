@@ -1,59 +1,52 @@
 #!/bin/bash
+set -euo pipefail
 
-# Prereqs: docker-compose
-#          curl
+# Restart from clean state
+docker compose down
+docker compose up -d --build
 
-generate_post_data()
-{
-  cat <<EOF
-{
-  "name": "elasticsearch-sink",
-  "config": {
-    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
-    "tasks.max": "1",
-    "topics": "example-topic",
-    "key.ignore": "true",
-    "schema.ignore": "true",
-    "connection.url": "http://elasticsearch:9200",
-    "type.name": "_doc",
-    "name": "elasticsearch-sink",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false",
-    "transforms": "insertTS,formatTS",
-    "transforms.insertTS.type": "org.apache.kafka.connect.transforms.InsertField\$Value",
-    "transforms.insertTS.timestamp.field": "messageTS",
-    "transforms.formatTS.type": "org.apache.kafka.connect.transforms.TimestampConverter\$Value",
-    "transforms.formatTS.format": "yyyy-MM-dd'T'HH:mm:ss",
-    "transforms.formatTS.field": "messageTS",
-    "transforms.formatTS.target.type": "string"
-  }
-}
-EOF
-}
+# Wait for Kafka Connect to be ready
+echo "Waiting for Kafka Connect to be ready..."
+until curl -sf http://localhost:8083/ > /dev/null 2>&1; do
+  echo "  Connect not ready yet, retrying in 5s..."
+  sleep 5
+done
+echo "Kafka Connect is ready."
 
-# Restart everything from empty. The yaml file defining the
-# containers has no persistent volumes.
-docker-compose down
-docker-compose up -d
+# Deploy connector
+echo "Creating Elasticsearch sink connector..."
+curl -sf -X POST \
+  -H "Content-Type: application/json" \
+  --data @connector-config.json \
+  http://localhost:8083/connectors | python3 -m json.tool
 
-# Give it a chance to start
-echo "Waiting for 180 seconds..."
-sleep 180
+# Wait for connector to initialize
+echo "Waiting for connector to start..."
+sleep 10
 
-# Configure kafka connect
-curl -i \
--H "Content-Type:application/json" \
--X POST --data "$(generate_post_data)" "http://localhost:8083/connectors"
+# Verify connector status
+echo "Connector status:"
+curl -sf http://localhost:8083/connectors/elasticsearch-sink/status | python3 -m json.tool
 
-# Wait a little to give everything chance to stabilise
-echo "Waiting for 15 seconds..."
-sleep 15
+# Publish test messages
+echo "Publishing test messages to Kafka..."
+docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka:9092 --topic example-topic \
+  <<< '{"request": {"userId": "23768432478278"}}'
 
-#Publish messages to kafka
-docker exec -i kafka bash -c "echo '{\"request\": {\"userId\" : \"23768432478278\"}}' | /opt/kafka/bin/kafka-console-producer.sh --broker-list kafka:9092 --topic example-topic"
-docker exec -i kafka bash -c "echo '{\"request\": {\"userId\" : \"23768432432453\"}}' | /opt/kafka/bin/kafka-console-producer.sh --broker-list kafka:9092 --topic example-topic"
-docker exec -i kafka bash -c "echo '{\"request\": {\"userId\" : \"23768432432237\"}}' | /opt/kafka/bin/kafka-console-producer.sh --broker-list kafka:9092 --topic example-topic"
+docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka:9092 --topic example-topic \
+  <<< '{"request": {"userId": "23768432432453"}}'
 
-exit $rc
+docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka:9092 --topic example-topic \
+  <<< '{"request": {"userId": "23768432432237"}}'
+
+echo "Messages published. Waiting for Elasticsearch indexing..."
+sleep 5
+
+# Verify messages in Elasticsearch
+echo "Verifying messages in Elasticsearch:"
+curl -sf "http://localhost:9200/example-topic/_search?pretty"
+
+echo "Done!"
